@@ -8,8 +8,21 @@ probe/EmptyPlayer/*.csproj
 probe/EmptyPlayer/*.sln
 probe/EmptyPlayer/*.slnx
 
+demo/UrpDemo/[Ll]ibrary/
+demo/UrpDemo/[Tt]emp/
+demo/UrpDemo/[Ll]ogs/
+demo/UrpDemo/[Uu]ser[Ss]ettings/
+demo/UrpDemo/[Oo]bj/
+demo/UrpDemo/*.csproj
+demo/UrpDemo/*.sln
+demo/UrpDemo/*.slnx
+
 # Player builds (Unity binaries, hundreds of MB)
 probe/builds/
+demo/builds/
+
+# Benchmark runs: one JSON and log per run. The README carries the summary.
+demo/results/
 
 # .NET build output
 [Bb]in/
