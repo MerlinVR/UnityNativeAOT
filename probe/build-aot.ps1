@@ -3,6 +3,7 @@
 #   .\build-aot.ps1                 build, stage, run
 #   .\build-aot.ps1 -SkipBuild      run the staged player again
 #   .\build-aot.ps1 -NoRun          build and stage only
+#   .\build-aot.ps1 -AllRoots       compile in every assembly the stock player lists (slower, much larger)
 #
 # Needs probe\builds\coreclr (Builder.BuildCoreCLR) and probe\tools\asmdump\out\asmdump.exe.
 param(
@@ -11,6 +12,7 @@ param(
     [switch]$Optimize,
     [switch]$Symbols,
     [string]$Roots = "",
+    [switch]$AllRoots,
     [int]$TimeoutSec = 60,
     [int]$Tail = 30
 )
@@ -22,7 +24,11 @@ $publicized = "$probe\builds\publicized"
 $patched = "$probe\builds\patched"
 $player = "$probe\builds\coreclr-aot"
 $defaultRoots = "Unity.Private.Scripting;Unity.Scripting;UnityEngine.ScriptingModule;UnityEngine.CoreModule;UnityEngine.ManagedKernelModule;UnityEngine.AnimationModule;UnityEngine;Assembly-CSharp"
-if ($Roots -eq "") { $Roots = $defaultRoots }
+if ($AllRoots) {
+    $stock = (Get-Content "$probe\builds\coreclr\Probe_Data\ScriptingAssemblies.json" -Raw | ConvertFrom-Json).names
+    $Roots = (@("Unity.Private.Scripting") + ($stock | ForEach-Object { $_ -replace '\.dll$', '' })) -join ';'
+}
+elseif ($Roots -eq "") { $Roots = $defaultRoots }
 
 function Step($name) { Write-Output "== $name ($((Get-Date).ToString('HH:mm:ss')))" }
 
@@ -61,6 +67,14 @@ if (-not $SkipBuild) {
         Copy-Item "$probe\builds\coreclr" $player -Recurse
         Remove-Item "$player\CoreCLR\native\clrjit.dll", "$player\CoreCLR\native\mscordaccore.dll", "$player\CoreCLR\native\mscordbi.dll" -ErrorAction SilentlyContinue
     }
+    else {
+        # Pick up a rebuilt Unity player: its scene data and IL assemblies, not the runtime that is replaced here.
+        foreach ($dir in "Probe_Data", "Managed") {
+            robocopy "$probe\builds\coreclr\$dir" "$player\$dir" /MIR /NJH /NJS /NDL /NFL /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { Write-Output "copying $dir into the staged player failed"; exit 1 }
+        }
+        $global:LASTEXITCODE = 0   # robocopy reports "files copied" as 1
+    }
     $native = Get-Item "$probe\AotScripting\bin\Release\net10.0\win-x64\publish\AotScripting.dll"
     Copy-Item $native.FullName "$player\CoreCLR\native\coreclr.dll" -Force
     "  coreclr.dll = {0:N1} MB" -f ($native.Length / 1MB)
@@ -86,7 +100,8 @@ $env:CORECLR_STANDIN_LOG = $standinLog
 $p = Start-Process -FilePath "$player\Probe.exe" -ArgumentList @("-batchmode", "-nographics", "-logFile", "`"$playerLog`"") -PassThru
 if (-not $p.WaitForExit($TimeoutSec * 1000)) { $p.Kill(); "player timed out after $TimeoutSec s and was killed" }
 else { "player exit code: 0x{0:x}" -f $p.ExitCode }
-Get-Process UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false
+# Only this player's crash handler: an open editor has one of its own.
+Get-Process UnityCrashHandler64 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$player\*" } | Stop-Process -Force -Confirm:$false
 
 function Short($line) { if ($line.Length -gt 260) { $line.Substring(0, 260) } else { $line } }
 
@@ -95,6 +110,12 @@ if (Test-Path $standinLog) { Get-Content $standinLog | Select-Object -Last $Tail
 "-- player log: PROBE lines, exceptions and the native crash stack"
 if (Test-Path $playerLog) {
     $lines = Get-Content $playerLog
-    $lines | Where-Object { $_ -match '^PROBE|Exception|^\s+at |NotSupported|Unable to|Could not|Failed|Fatal|Assert|Crash!!!|^0x[0-9A-F]{16} \((?!ntdll|KERNEL|USER32|ucrtbase)' } |
+    # One line per class or method the engine wanted from an assembly that was not compiled in.
+    $lookups = @($lines | Where-Object { $_ -match '^Unable to find (type|method) ' })
+    if ($lookups.Count -gt 0) {
+        $modules = $lookups | ForEach-Object { if ($_ -match '\[([^\]]+)\.dll\]') { $Matches[1] } } | Sort-Object -Unique
+        "$($lookups.Count) failed lookups in: $($modules -join ', ')"
+    }
+    $lines | Where-Object { $_ -match '^PROBE|Exception|^\s+at |NotSupported|Unable to (?!find (type|method) )|Could not|Failed|Fatal|Assert|Crash!!!|^0x[0-9A-F]{16} \((?!ntdll|KERNEL|USER32|ucrtbase)' } |
         Select-Object -First 45 | ForEach-Object { Short $_ }
 }

@@ -29,7 +29,7 @@ public class Probe : MonoBehaviour
         var after = AddressOf(probe[33]);
         Debug.Log("PROBE objectMoved=" + (before != after) + " before=0x" + before.ToString("x") + " after=0x" + after.ToString("x"));
 
-        Application.Quit();
+        // Exercise, on the same object, quits the player when its sequence ends.
     }
 
     static unsafe long AddressOf(object o)
