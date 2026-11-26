@@ -1,0 +1,29 @@
+# Unity project
+probe/EmptyPlayer/[Ll]ibrary/
+probe/EmptyPlayer/[Tt]emp/
+probe/EmptyPlayer/[Ll]ogs/
+probe/EmptyPlayer/[Uu]ser[Ss]ettings/
+probe/EmptyPlayer/[Oo]bj/
+probe/EmptyPlayer/*.csproj
+probe/EmptyPlayer/*.sln
+probe/EmptyPlayer/*.slnx
+
+# Player builds (Unity binaries, hundreds of MB)
+probe/builds/
+
+# .NET build output
+[Bb]in/
+[Oo]bj/
+out/
+
+# Copies of Unity's assemblies made by the tooling (publicized or patched). Regenerate, don't commit.
+probe/**/patched/
+probe/**/publicized/
+
+# Run and build logs
+*.log
+
+# IDE
+.vs/
+.idea/
+*.user

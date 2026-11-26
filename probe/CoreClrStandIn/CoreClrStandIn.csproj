@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Stage-1 spike: a NativeAOT shared library that impersonates Unity's forked coreclr.dll.
+    It exports the entry points the CoreCLR build of UnityPlayer.dll binds by name and logs
+    every call, to show how far the engine gets with no JIT runtime present.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>coreclr</AssemblyName>
+    <RootNamespace>CoreClrStandIn</RootNamespace>
+    <OutputType>Library</OutputType>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
