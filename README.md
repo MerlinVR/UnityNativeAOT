@@ -22,16 +22,18 @@ Every `UnityPlayer.dll` variant binds its scripting runtime by name at run time.
   type metadata, GC and exception models. It would need a new compiler backend, or a NativeAOT library that
   impersonates all of `GameAssembly.dll` for an engine that holds raw object pointers.
 - **NativeAOT behind the CoreCLR engine build** works for the test scene. A NativeAOT library named `coreclr.dll`,
-  holding Unity's managed layer and the game's scripts, is accepted by the stock player: the scene loads, the
-  `MonoBehaviour` runs and the player quits cleanly with no JIT present. Getting there meant replacing the parts of
-  the embedding layer that need a JIT or CoreCLR internals (see [Stage 3](#stage-3-how-it-works)). It is desktop
-  only, because Unity ships CoreCLR engine builds only for Windows, macOS and Linux.
+  holding Unity's managed layer and the game's scripts, is accepted by the stock player with no JIT present. A scene
+  that exercises serialization, component and object lifetime calls, coroutines, messages, exceptions and asset
+  unloading prints the same output as on stock CoreCLR, except where it asks for a generic instantiation that only
+  exists at run time. Getting there meant replacing the parts of the embedding layer that need a JIT or CoreCLR
+  internals (see [Stage 3](#stage-3-how-it-works)). It is desktop only, because Unity ships CoreCLR engine builds
+  only for Windows, macOS and Linux.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `probe/EmptyPlayer` | Unity project with one scene and one `MonoBehaviour` (`Probe.cs`) that logs runtime facts and quits. `Builder.cs` builds it per scripting backend. |
+| `probe/EmptyPlayer` | Unity project with one scene. `Probe.cs` logs runtime facts; `Exercise.cs` runs one check per line over the scripting features a game leans on and quits. `Builder.cs` writes the scene and builds a player per scripting backend. |
 | `probe/CoreClrStandIn` | Stage 1. A NativeAOT library that exports Unity's `coreclr.dll` surface as logging stubs, to record what the engine calls. |
 | `probe/AotRuntime` | Stage 3. The replacement runtime pieces: the `coreclr.dll` exports and the methods that stand in for JIT- or CoreCLR-only code in Unity's assemblies. |
 | `probe/AotScripting` | The NativeAOT project that compiles `AotRuntime`, Unity's assemblies and the game's assemblies into one `coreclr.dll`. It has no code of its own. |
@@ -62,7 +64,12 @@ probe\builds\coreclr-standin\Probe.exe -batchmode -nographics -logFile probe\pla
 
 # 3. Stage 3: compile everything with NativeAOT, stage it as coreclr.dll in probe\builds\coreclr-aot, run the player
 dotnet build probe\tools\asmdump -c Release -o probe\tools\asmdump\out
-probe\build-aot.ps1            # -Optimize, -Symbols, -Roots "A;B;C", -NoRun, -SkipBuild
+probe\build-aot.ps1            # eight rooted assemblies, about 10 s. Also -Optimize, -Symbols, -Roots "A;B;C", -NoRun, -SkipBuild
+probe\build-aot.ps1 -AllRoots  # every assembly the stock player lists, about 90 s
+
+# 4. Compare with stock CoreCLR: the "PROBE x." lines of the two logs should match
+probe\builds\coreclr\Probe.exe -batchmode -nographics -logFile probe\player-coreclr.log
+Compare-Object (Select-String '^PROBE x\.' probe\player-coreclr.log).Line (Select-String '^PROBE x\.' probe\player-aot.log).Line
 ```
 
 ## Stage 3: how it works
@@ -88,12 +95,27 @@ What had to be replaced, and with what:
 | TypeDef tokens come from the loaded image | NativeAOT keeps no tokens | Read from the IL files with `System.Reflection.Metadata` and matched by name |
 | Member handles are resolved through `RuntimeMethodHandleInternal` and friends | CoreCLR-private types | NativeAOT handles carry their declaring type (`Handles.cs`) |
 | Field offsets come from the fork's `mono_field_get_offset` | No public API | `RuntimeFieldInfo.Offset` in NativeAOT's reflection, reached with `UnsafeAccessor` |
+| `IntPtrObjectMarshalling` emits `DynamicMethod`s to reach the native pointer inside wrappers such as `AsyncOperation` | No JIT | Reflection on the same field (`Marshalling.cs`) |
+| The liveness walk (`coreclr_unity_liveness_*`) that tells the engine which of its objects scripts still reach | Implemented inside the fork's runtime; NativeAOT has no heap-walk API | A walk over the GC's own layout descriptors, from the engine's roots and from NativeAOT's static holders, inside a no-GC region (`Liveness.cs`) |
 | `StackFrame.GetMethodFromNativeIP`, `AssemblyLoadContext.s_ResolveAssemblyLocationOverride` | Exist only in Unity's fork | Managed frames are reported as unknown; the override is skipped |
 
-Known gaps: 34 of the native exports are still logging stubs (the liveness walk used for unloading assets, the
-profiler, thread attach); only the assemblies named by `-Roots` are compiled in, and the engine logs a lookup failure
-for each class it wants from a module that was left out; token lookups for methods and fields throw; nothing beyond
-the test scene has been exercised.
+Known gaps:
+
+- 27 of the native exports are still logging stubs. The test scene reaches two of them (`coreclr_unity_profiler_register`,
+  `coreclr_unity_set_on_fatal_error`); the rest cover shutdown, the profiler, GC mode switches, thread attach and a
+  few `mono_*` lookups.
+- The liveness walk does not see `[ThreadStatic]` roots, and it stops nothing: a no-GC region keeps objects from
+  moving, but other managed threads keep running. Its contract was inferred from Mono's `unity_liveness.c` and from
+  the arguments the engine passes.
+- A generic instantiation over a value type that is first named at run time has no code (`MakeGenericType`,
+  reflection-driven serializers). This is the usual ahead-of-time limit and IL2CPP has it too.
+- Everything reached by name must be rooted. By default only eight assemblies are, and the engine then logs a failed
+  lookup for each class it wants from the others; `-AllRoots` compiles in all of them.
+- Token lookups for methods and fields throw, and stack frames in managed code are not symbolised for the engine.
+- `runtime_invoke` and the wrapper accessors go through reflection, which is slow. A build pipeline would generate
+  them, as IL2CPP does.
+- Not exercised: rendering (the player ran with `-batchmode -nographics`), packages, Burst, the job system from
+  scripts, domain reload, and anything beyond the test scene.
 
 When the player dies without a message, the fail-fast text and managed stack are in the Windows Application event
 log under the `.NET Runtime` source.
@@ -115,3 +137,15 @@ log under the `.NET Runtime` source.
   a compacting GC. No managed exception was thrown during the run. Eight assemblies were rooted (30 compiled in),
   unoptimised and without symbols: ILC and the linker took about 10 seconds and produced a 22.9 MB `coreclr.dll`.
   The engine logged 122 lookup failures for classes of modules that were not compiled in.
+- Stage 3 with `-AllRoots`: all 92 assemblies the stock player lists are rooted (129 compiled in). ILC and the linker
+  took about 90 seconds unoptimised and produced a 217 MB `coreclr.dll`. No lookup failed.
+- The `Exercise` scene on stock CoreCLR and on the NativeAOT runtime (`-AllRoots`, four runs): 30 `PROBE x.` lines
+  each, exit code 0 both, and one line differs. `makegeneric.computed` prints `Queue`1` on CoreCLR and fails with
+  `NotSupportedException` on NativeAOT. The lines that match cover fields written by the scene loader, an object
+  reference, `GetComponent`, `AddComponent`, `Instantiate`, `Destroy`, `SendMessage`, `Invoke`, two coroutines,
+  `JsonUtility`, reflection, a second thread, an exception escaping `Update`, and `Resources.UnloadUnusedAssets`
+  keeping the textures a field and a static hold while destroying an unreferenced one.
+- Before `Liveness.cs` the liveness exports were stubs, and `UnloadUnusedAssets` destroyed all three textures.
+- One liveness pass in that scene: 5 roots, 70,816 objects visited (70,793 of them from statics), 10 reported, and
+  the no-GC region held.
+- Optimised, with the default eight roots: 18.4 MB, about 15 seconds, same output.
