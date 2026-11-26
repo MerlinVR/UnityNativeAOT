@@ -24,6 +24,7 @@ namespace AotRuntime
                 Log.Line($"runtime_invoke of a null method (class {ClassHandles.ToType(klass)?.FullName ?? "null"}); ignored");
                 return new RuntimeInterop.CacheInfo((obj, arguments) => null);
             }
+            InvokeTiming.RunOnce(klass);
             return new RuntimeInterop.CacheInfo(new Invoker(target).Call);
         }
 
@@ -33,6 +34,7 @@ namespace AotRuntime
             readonly ParameterInfo[] _parameters;
             readonly Type _thisValueType;
             readonly Type _returnEnumUnderlying;
+            readonly Action<object> _direct;
 
             public Invoker(MethodBase method)
             {
@@ -40,10 +42,48 @@ namespace AotRuntime
                 _parameters = method.GetParameters();
                 if (!method.IsStatic && method.DeclaringType.IsValueType) _thisValueType = method.DeclaringType;
                 if (method is MethodInfo info && info.ReturnType.IsEnum) _returnEnumUnderlying = Enum.GetUnderlyingType(info.ReturnType);
+                _direct = Direct(method, _parameters);
+            }
+
+            /// <summary>
+            /// The engine's most frequent call by far is an instance method without parameters or a result: Update,
+            /// LateUpdate, OnGUI and the like, once per component per frame. Those get an open delegate, which calls
+            /// the method itself instead of going through reflection. Action&lt;T&gt; has one body for every
+            /// reference type T, so the delegate can be invoked as Action&lt;object&gt; whatever the declaring type.
+            /// </summary>
+            static Action<object> Direct(MethodBase method, ParameterInfo[] parameters)
+            {
+                if (!(method is MethodInfo info) || info.IsStatic || parameters.Length != 0 || info.ReturnType != typeof(void) || info.IsGenericMethod) return null;
+                Type declaring = info.DeclaringType;
+                if (declaring == null || declaring.IsValueType || declaring.ContainsGenericParameters) return null;
+                try
+                {
+                    return Unsafe.As<Action<object>>(info.CreateDelegate(typeof(Action<>).MakeGenericType(declaring)));
+                }
+                catch (Exception e)
+                {
+                    Log.Line($"no direct call for {declaring.FullName}.{info.Name}, using reflection: {e.GetType().Name}");
+                    return null;
+                }
             }
 
             public object Call(IntPtr obj, IntPtr arguments)
             {
+                if (!AllocTrace.On) return CallCore(obj, arguments);
+                AllocTrace.Enter();
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                try { return CallCore(obj, arguments); }
+                finally { AllocTrace.Leave(_method, GC.GetAllocatedBytesForCurrentThread() - before); }
+            }
+
+            object CallCore(IntPtr obj, IntPtr arguments)
+            {
+                if (_direct != null)
+                {
+                    _direct(obj.ToManagedRepresentation());
+                    return null;
+                }
+
                 object target = null;
                 if (!_method.IsStatic)
                     target = _thisValueType != null ? Native.Box(_thisValueType, obj) : obj.ToManagedRepresentation();

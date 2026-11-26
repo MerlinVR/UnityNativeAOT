@@ -24,6 +24,8 @@ namespace AotRuntime
                     ManagedDir = Log.Str(values[i]).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)[0];
             }
             Log.Line($"  managed dir: {ManagedDir}; AOT-compiled assemblies: {AotAssemblies.Count}");
+            try { Log.Line($"  process started {(DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime).TotalMilliseconds:F0} ms before this call"); }
+            catch (Exception) { }
             Diagnostics.Install();
             if (hostHandle != null) *hostHandle = (void*)0x1;
             if (domainId != null) *domainId = 1;

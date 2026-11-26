@@ -11,7 +11,10 @@
     AotRoots      assemblies compiled in full, because the engine finds their types and members by name
   -->
   <!-- build-aot.ps1 writes AotRoots here; a list cannot be passed with -p because MSBuild splits it on ';' and ','. -->
-  <Import Project="$(MSBuildThisFileDirectory)..\builds\aot-roots.props" Condition="Exists('$(MSBuildThisFileDirectory)..\builds\aot-roots.props')" />
+  <PropertyGroup>
+    <AotRootsProps Condition="'$(AotRootsProps)' == ''">$(MSBuildThisFileDirectory)..\builds\aot-roots.props</AotRootsProps>
+  </PropertyGroup>
+  <Import Project="$(AotRootsProps)" Condition="Exists('$(AotRootsProps)')" />
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -35,6 +38,9 @@
 
     <!-- Unity's embedding layer finds members by name at run time: keep reflection data for everything compiled. -->
     <IlcTrimMetadata>false</IlcTrimMetadata>
+
+    <!-- NativeAOT defaults to a LINQ built for size; game code runs LINQ per frame, so take the one built for speed. -->
+    <UseSizeOptimizedLinq>false</UseSizeOptimizedLinq>
 
     <!-- The trim/AOT warnings were counted once (see README); they are noise while iterating. -->
     <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>

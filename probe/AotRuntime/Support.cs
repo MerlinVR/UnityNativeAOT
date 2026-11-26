@@ -19,6 +19,7 @@ namespace AotRuntime
     /// <summary>
     /// Marks a static method that replaces every call to <paramref name="callee"/> (written as Cecil prints it, for
     /// example "System.IntPtr System.RuntimeTypeHandle::get_Value()") made from inside one of Unity's assemblies.
+    /// With "*" as the assembly, the calls are replaced in every assembly of Unity's and of the game's.
     /// </summary>
     [AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
     public sealed class RedirectCallsAttribute : Attribute
@@ -38,7 +39,11 @@ namespace AotRuntime
     public static unsafe class Log
     {
         static readonly object s_Lock = new object();
+        static readonly long s_Started = System.Diagnostics.Stopwatch.GetTimestamp();
         static StreamWriter s_Writer;
+
+        /// <summary>Milliseconds since the runtime's first log line, which is its first call from the engine.</summary>
+        public static double Elapsed => (System.Diagnostics.Stopwatch.GetTimestamp() - s_Started) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
         public static void Line(string text)
         {
@@ -51,7 +56,7 @@ namespace AotRuntime
                         string path = Environment.GetEnvironmentVariable("CORECLR_STANDIN_LOG") ?? Path.Combine(Path.GetTempPath(), "coreclr-standin.log");
                         s_Writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false)) { AutoFlush = true };
                     }
-                    s_Writer.WriteLine($"[tid {Environment.CurrentManagedThreadId}] {text}");
+                    s_Writer.WriteLine($"[{Elapsed,8:F1} ms tid {Environment.CurrentManagedThreadId}] {text}");
                 }
                 catch (IOException) { }
             }

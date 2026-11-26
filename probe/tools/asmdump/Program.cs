@@ -191,7 +191,8 @@ switch (cmd)
         // For every static method in shims.dll marked [Detour("Assembly", "Type.FullName", "Method")], replaces the body of
         // that method in <inDir>\Assembly.dll with a call to the shim and writes the result to <outDir>. A shim for an
         // instance method takes the instance as its first parameter. Overloads are picked by the shim's parameter types.
-        // [RedirectCalls("Assembly", "<callee full name>")] instead rewrites every call to that callee inside Assembly.
+        // [RedirectCalls("Assembly", "<callee full name>")] instead rewrites every call to that callee inside Assembly,
+        // or with "*" inside every Unity*.dll and Assembly-CSharp*.dll of <inDir>.
         var shims = Load(args[1]);
         var inDir = args[2];
         var outDir = args[3];
@@ -221,26 +222,38 @@ switch (cmd)
             {
                 var asmName = (string)attr.ConstructorArguments[0].Value;
                 var callee = (string)attr.ConstructorArguments[1].Value;
-                if (!targets.TryGetValue(asmName, out var mod))
-                {
-                    var p = Path.Combine(inDir, asmName + ".dll");
-                    if (!File.Exists(p)) { failed++; Console.WriteLine($"REDIRECT FAILED {shim.Name}: assembly {asmName} not found"); continue; }
-                    targets[asmName] = mod = Load(p);
-                }
+                // "*" is every assembly of Unity's and of the game's that makes the call; none of them has to.
+                bool everywhere = asmName == "*";
+                var names = everywhere
+                    ? Directory.GetFiles(inDir, "*.dll").Select(f => Path.GetFileNameWithoutExtension(f)).Where(n => n.StartsWith("Unity") || n.StartsWith("Assembly-CSharp")).OrderBy(n => n).ToList()
+                    : new List<string> { asmName };
                 int sites = 0;
-                foreach (var method in AllTypes(mod).SelectMany(t => t.Methods).Where(m => m.HasBody))
-                foreach (var ins in method.Body.Instructions)
+                foreach (var name in names)
                 {
-                    if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt) || ins.Operand is not MethodReference called || called.FullName != callee) continue;
-                    var parameters = new List<TypeReference>();
-                    if (called.HasThis)
-                        parameters.Add(shim.Parameters[0].ParameterType.IsByReference ? new Mono.Cecil.ByReferenceType(called.DeclaringType) : called.DeclaringType);
-                    parameters.AddRange(called.Parameters.Select(p => p.ParameterType));
-                    ins.OpCode = OpCodes.Call;
-                    ins.Operand = ShimRef(mod, shim, called.ReturnType, parameters);
-                    sites++;
+                    bool kept = targets.TryGetValue(name, out var mod);
+                    if (!kept)
+                    {
+                        var p = Path.Combine(inDir, name + ".dll");
+                        if (!File.Exists(p)) { failed++; Console.WriteLine($"REDIRECT FAILED {shim.Name}: assembly {name} not found"); continue; }
+                        mod = Load(p);
+                    }
+                    int before = sites;
+                    foreach (var method in AllTypes(mod).SelectMany(t => t.Methods).Where(m => m.HasBody))
+                    foreach (var ins in method.Body.Instructions)
+                    {
+                        if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt) || ins.Operand is not MethodReference called || called.FullName != callee) continue;
+                        var parameters = new List<TypeReference>();
+                        if (called.HasThis)
+                            parameters.Add(shim.Parameters[0].ParameterType.IsByReference ? new Mono.Cecil.ByReferenceType(called.DeclaringType) : called.DeclaringType);
+                        parameters.AddRange(called.Parameters.Select(p => p.ParameterType));
+                        ins.OpCode = OpCodes.Call;
+                        ins.Operand = ShimRef(mod, shim, called.ReturnType, parameters);
+                        sites++;
+                    }
+                    // An assembly that was only searched is not written out.
+                    if (!kept && (sites > before || !everywhere)) targets[name] = mod;
                 }
-                if (sites == 0) { failed++; Console.WriteLine($"REDIRECT FAILED {shim.Name}: no call to '{callee}' in {asmName}"); }
+                if (sites == 0 && !everywhere) { failed++; Console.WriteLine($"REDIRECT FAILED {shim.Name}: no call to '{callee}' in {asmName}"); }
                 redirected += sites;
             }
 

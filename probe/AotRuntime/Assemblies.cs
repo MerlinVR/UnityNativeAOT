@@ -79,29 +79,31 @@ namespace AotRuntime
     /// </summary>
     public static class Tokens
     {
+        // Names come from the IL file once per assembly; a type is only looked up when the engine asks for its row.
         sealed class Table
         {
-            public Type[] ByRow = Array.Empty<Type>();
-            public readonly Dictionary<Type, int> Rows = new Dictionary<Type, int>();
-            public int TypeDefCount;
+            public string[] NameByRow = Array.Empty<string>();
+            public Type[] TypeByRow = Array.Empty<Type>();
+            public readonly Dictionary<string, int> RowByName = new Dictionary<string, int>();
+            public readonly Dictionary<Type, uint> TokenByType = new Dictionary<Type, uint>();
         }
 
         static readonly Dictionary<Assembly, Table> s_Tables = new Dictionary<Assembly, Table>();
+        static readonly Dictionary<Assembly, int> s_Counts = new Dictionary<Assembly, int>();
+
+        static string IlPath(Assembly assembly) => Path.Combine(Host.ManagedDir, assembly.GetName().Name + ".dll");
 
         static Table For(Assembly assembly)
         {
-            lock (s_Tables)
-            {
-                if (!s_Tables.TryGetValue(assembly, out Table table))
-                    s_Tables[assembly] = table = Build(assembly);
-                return table;
-            }
+            if (!s_Tables.TryGetValue(assembly, out Table table))
+                s_Tables[assembly] = table = Build(assembly);
+            return table;
         }
 
         static Table Build(Assembly assembly)
         {
             var table = new Table();
-            string path = Path.Combine(Host.ManagedDir, assembly.GetName().Name + ".dll");
+            string path = IlPath(assembly);
             if (!File.Exists(path))
             {
                 Log.Line($"tokens: no IL file for {assembly.GetName().Name}");
@@ -110,19 +112,16 @@ namespace AotRuntime
             using FileStream stream = File.OpenRead(path);
             using var pe = new PEReader(stream);
             MetadataReader md = pe.GetMetadataReader();
-            table.TypeDefCount = md.GetTableRowCount(TableIndex.TypeDef);
-            table.ByRow = new Type[table.TypeDefCount + 1];
-            int missing = 0;
+            int count = md.GetTableRowCount(TableIndex.TypeDef);
+            table.NameByRow = new string[count + 1];
+            table.TypeByRow = new Type[count + 1];
             foreach (TypeDefinitionHandle handle in md.TypeDefinitions)
             {
-                Type type = null;
-                try { type = assembly.GetType(FullName(md, handle), throwOnError: false); } catch (Exception) { }
-                if (type == null) { missing++; continue; }
                 int row = MetadataTokens.GetRowNumber(handle);
-                table.ByRow[row] = type;
-                table.Rows[type] = row;
+                string name = FullName(md, handle);
+                table.NameByRow[row] = name;
+                table.RowByName[name] = row;
             }
-            Log.Line($"tokens: {assembly.GetName().Name} has {table.TypeDefCount} TypeDefs, {missing} without a compiled type");
             return table;
         }
 
@@ -136,21 +135,56 @@ namespace AotRuntime
             return ns.Length == 0 ? name : ns + "." + name;
         }
 
-        public static int TypeDefCount(Assembly assembly) => For(assembly).TypeDefCount;
+        /// <summary>Asked once for every assembly as it loads, so it reads the count and nothing else.</summary>
+        public static int TypeDefCount(Assembly assembly)
+        {
+            lock (s_Tables)
+            {
+                if (s_Counts.TryGetValue(assembly, out int count)) return count;
+                string path = IlPath(assembly);
+                if (File.Exists(path))
+                {
+                    using FileStream stream = File.OpenRead(path);
+                    using var pe = new PEReader(stream);
+                    count = pe.GetMetadataReader().GetTableRowCount(TableIndex.TypeDef);
+                }
+                else Log.Line($"tokens: no IL file for {assembly.GetName().Name}");
+                s_Counts[assembly] = count;
+                return count;
+            }
+        }
 
         public static uint TokenOf(Type type)
         {
             const uint typeDef = 0x02000000;
             if (type.HasElementType || type.IsGenericParameter) return typeDef;
             if (type.IsGenericType && !type.IsGenericTypeDefinition) type = type.GetGenericTypeDefinition();
-            return For(type.Assembly).Rows.TryGetValue(type, out int row) ? typeDef | (uint)row : typeDef;
+            lock (s_Tables)
+            {
+                Table table = For(type.Assembly);
+                if (table.TokenByType.TryGetValue(type, out uint token)) return token;
+                token = type.FullName != null && table.RowByName.TryGetValue(type.FullName, out int row) ? typeDef | (uint)row : typeDef;
+                table.TokenByType[type] = token;
+                return token;
+            }
         }
 
         public static Type TypeFromToken(Assembly assembly, uint token)
         {
-            Table table = For(assembly);
             uint row = token & 0x00FFFFFF;
-            return (token >> 24) == 0x02 && row < table.ByRow.Length ? table.ByRow[row] : null;
+            if ((token >> 24) != 0x02) return null;
+            lock (s_Tables)
+            {
+                Table table = For(assembly);
+                if (row >= table.NameByRow.Length || table.NameByRow[row] == null) return null;
+                Type type = table.TypeByRow[row];
+                if (type == null)
+                {
+                    try { type = assembly.GetType(table.NameByRow[row], throwOnError: false); } catch (Exception) { }
+                    table.TypeByRow[row] = type;
+                }
+                return type;
+            }
         }
 
         // ---- ImageInterop: its static constructor binds to CoreCLR-private RuntimeFieldHandleInternal/RuntimeMethodHandleInternal ----
