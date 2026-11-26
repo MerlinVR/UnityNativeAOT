@@ -1,0 +1,7 @@
+<!-- Core library members UnityPlayer.dll looks up by name; nothing in managed code references them statically. -->
+<linker>
+  <assembly fullname="System.Private.CoreLib">
+    <type fullname="System.Collections.IEnumerator" preserve="all" />
+    <type fullname="System.IDisposable" preserve="all" />
+  </assembly>
+</linker>

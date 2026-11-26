@@ -21,10 +21,11 @@ Every `UnityPlayer.dll` variant binds its scripting runtime by name at run time.
 - **NativeAOT with libil2cpp** is not a linking problem. The two are complete runtimes with different object layouts,
   type metadata, GC and exception models. It would need a new compiler backend, or a NativeAOT library that
   impersonates all of `GameAssembly.dll` for an engine that holds raw object pointers.
-- **NativeAOT behind the CoreCLR engine build** is plausible. A NativeAOT library named `coreclr.dll` is accepted by the
-  stock player, and ILC compiles every Unity engine assembly with no errors. What remains is replacing the parts of
-  the embedding layer that need a JIT or CoreCLR internals. It is desktop only, because Unity ships CoreCLR engine
-  builds only for Windows, macOS and Linux.
+- **NativeAOT behind the CoreCLR engine build** works for the test scene. A NativeAOT library named `coreclr.dll`,
+  holding Unity's managed layer and the game's scripts, is accepted by the stock player: the scene loads, the
+  `MonoBehaviour` runs and the player quits cleanly with no JIT present. Getting there meant replacing the parts of
+  the embedding layer that need a JIT or CoreCLR internals (see [Stage 3](#stage-3-how-it-works)). It is desktop
+  only, because Unity ships CoreCLR engine builds only for Windows, macOS and Linux.
 
 ## Layout
 
@@ -32,7 +33,9 @@ Every `UnityPlayer.dll` variant binds its scripting runtime by name at run time.
 |---|---|
 | `probe/EmptyPlayer` | Unity project with one scene and one `MonoBehaviour` (`Probe.cs`) that logs runtime facts and quits. `Builder.cs` builds it per scripting backend. |
 | `probe/CoreClrStandIn` | Stage 1. A NativeAOT library that exports Unity's `coreclr.dll` surface as logging stubs, to record what the engine calls. |
-| `probe/AotScripting` | Stage 2. The same exports, with Unity's managed layer and the game's assemblies compiled in by NativeAOT. |
+| `probe/AotRuntime` | Stage 3. The replacement runtime pieces: the `coreclr.dll` exports and the methods that stand in for JIT- or CoreCLR-only code in Unity's assemblies. |
+| `probe/AotScripting` | The NativeAOT project that compiles `AotRuntime`, Unity's assemblies and the game's assemblies into one `coreclr.dll`. It has no code of its own. |
+| `probe/build-aot.ps1` | Runs the whole stage 3 pipeline and the player, then prints the interesting parts of both logs. |
 | `probe/tools/asmdump` | Assembly inspection and patching helper built on Mono.Cecil and ICSharpCode.Decompiler. |
 | `probe/tools/binstrings.py` | Extracts strings matching a regex from a native binary. |
 
@@ -56,7 +59,44 @@ Copy-Item probe\CoreClrStandIn\bin\Release\net10.0\win-x64\publish\coreclr.dll p
 Remove-Item probe\builds\coreclr-standin\CoreCLR\native\clrjit.dll, probe\builds\coreclr-standin\CoreCLR\native\mscordac*.dll, probe\builds\coreclr-standin\CoreCLR\native\mscordbi.dll
 $env:CORECLR_STANDIN_LOG = "$PWD\probe\standin.log"
 probe\builds\coreclr-standin\Probe.exe -batchmode -nographics -logFile probe\player-standin.log
+
+# 3. Stage 3: compile everything with NativeAOT, stage it as coreclr.dll in probe\builds\coreclr-aot, run the player
+dotnet build probe\tools\asmdump -c Release -o probe\tools\asmdump\out
+probe\build-aot.ps1            # -Optimize, -Symbols, -Roots "A;B;C", -NoRun, -SkipBuild
 ```
+
+## Stage 3: how it works
+
+`build-aot.ps1` does five things:
+
+1. `asmdump publicize-all` writes copies of Unity's assemblies with every member public, so `AotRuntime` can be
+   compiled against Unity's internals as ordinary C#.
+2. `AotRuntime` is compiled. Its methods carry `[Detour(assembly, type, method)]` or `[RedirectCalls(assembly, callee)]`.
+3. `asmdump detour` rewrites the real Unity assemblies: a detoured method's body becomes a call to its replacement,
+   and a redirected call site calls the replacement instead of the original callee.
+4. ILC compiles `AotRuntime`, the patched assemblies and the untouched ones into one library. The `coreclr.dll` exports
+   come from `AotRuntime` through `UnmanagedEntryPointsAssembly`.
+5. The library replaces `CoreCLR\native\coreclr.dll` in a copy of the CoreCLR player with the JIT deleted.
+
+What had to be replaced, and with what:
+
+| Unity's CoreCLR code | Why it cannot run | Replacement |
+|---|---|---|
+| A class is a `MethodTable*`, and the fork adds a user-data field to `MethodTable` that the engine reads at a fixed offset | NativeAOT's `MethodTable` has no such field | A class is a pointer to a small native `ClassHandle` struct (`ClassHandles.cs`). The conversions are three methods of `Unity.Private.Scripting.Extensions` plus 14 `RuntimeTypeHandle.Value` call sites in the engine modules |
+| `runtime_invoke` emits a `DynamicMethod` per target | No JIT | A reflection invoker that unpacks the engine's argument array the same way (`Invoke.cs`) |
+| Assemblies are loaded from the `Managed` folder into load contexts | Nothing can be loaded | Lookup by name among the compiled-in assemblies (`Assemblies.cs`) |
+| TypeDef tokens come from the loaded image | NativeAOT keeps no tokens | Read from the IL files with `System.Reflection.Metadata` and matched by name |
+| Member handles are resolved through `RuntimeMethodHandleInternal` and friends | CoreCLR-private types | NativeAOT handles carry their declaring type (`Handles.cs`) |
+| Field offsets come from the fork's `mono_field_get_offset` | No public API | `RuntimeFieldInfo.Offset` in NativeAOT's reflection, reached with `UnsafeAccessor` |
+| `StackFrame.GetMethodFromNativeIP`, `AssemblyLoadContext.s_ResolveAssemblyLocationOverride` | Exist only in Unity's fork | Managed frames are reported as unknown; the override is skipped |
+
+Known gaps: 34 of the native exports are still logging stubs (the liveness walk used for unloading assets, the
+profiler, thread attach); only the assemblies named by `-Roots` are compiled in, and the engine logs a lookup failure
+for each class it wants from a module that was left out; token lookups for methods and fields throw; nothing beyond
+the test scene has been exercised.
+
+When the player dies without a message, the fail-fast text and managed stack are in the Windows Application event
+log under the `.NET Runtime` source.
 
 ## Results recorded on 2026-11-25
 
@@ -69,3 +109,9 @@ probe\builds\coreclr-standin\Probe.exe -batchmode -nographics -logFile probe\pla
   25 minutes with 0 errors and 250 distinct trim/AOT warnings. At run time Unity's own bootstrapper initialised 11 of the
   21 tables, then `ImageInterop`'s static constructor threw because it reflects on the CoreCLR-private type
   `System.RuntimeFieldHandleInternal`.
+- Stage 3: with 21 methods detoured and 14 call sites redirected in three Unity assemblies, the stock CoreCLR player
+  (`-batchmode -nographics`) loaded the scene, ran `Probe.Start()` and exited with code 0. The script reported
+  `.NET 10.0.1`, no dynamic code, an empty `Assembly.Location` for the core library and an object that moved across
+  a compacting GC. No managed exception was thrown during the run. Eight assemblies were rooted (30 compiled in),
+  unoptimised and without symbols: ILC and the linker took about 10 seconds and produced a 22.9 MB `coreclr.dll`.
+  The engine logged 122 lookup failures for classes of modules that were not compiled in.

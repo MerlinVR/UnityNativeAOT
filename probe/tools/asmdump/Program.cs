@@ -14,7 +14,12 @@ using Mono.Cecil.Cil;
 //   asmdump members <dll> <typeRegex>            list fields/methods with interop attributes
 //   asmdump il <dll> <typeRegex> <methodRegex>   dump IL
 //   asmdump cs <dll> <typeFullName>...           decompile types to C#
+//   asmdump csm <dll> <typeFullName> [regex]     decompile a type's methods one at a time
 //   asmdump find <dll> <regex>                   find methods whose IL references a member/string matching regex
+//   asmdump calli <dll>...                       histogram of calli calling conventions
+//   asmdump publicize <in> <out> <type> <method>...   make one type and some of its methods public
+//   asmdump publicize-all <outDir> <dll>...      write all-public copies to compile against
+//   asmdump detour <shims.dll> <inDir> <outDir>  redirect methods to [Detour] shims
 
 if (args.Length < 2) { Console.Error.WriteLine("usage: asmdump <cmd> <dll> ..."); return 1; }
 var cmd = args[0];
@@ -149,6 +154,172 @@ switch (cmd)
             Console.WriteLine($"made public: {type.FullName}::{method.Name}");
         }
         mod.Write(args[2]);
+        break;
+    }
+    case "publicize-all":
+    {
+        // asmdump publicize-all <outDir> <dll>...
+        // Writes copies in which every type, method and field is public. They are compile-time references only:
+        // ILC does not check accessibility, so code compiled against them runs against the untouched originals.
+        var outDir = args[1];
+        Directory.CreateDirectory(outDir);
+        foreach (var path in args.Skip(2))
+        {
+            var outPath = Path.Combine(outDir, Path.GetFileName(path));
+            if (File.Exists(outPath) && File.GetLastWriteTimeUtc(outPath) >= File.GetLastWriteTimeUtc(path)) continue;
+            var mod = Load(path);
+            foreach (var t in AllTypes(mod))
+            {
+                // Unity embeds internal polyfills of BCL types (UnmanagedCallersOnlyAttribute, ...). Made public they
+                // would collide with the real ones in every file that uses them.
+                var top = t; while (top.IsNested) top = top.DeclaringType;
+                if (top.Namespace.StartsWith("System") || top.Namespace.StartsWith("Microsoft")) continue;
+                if (t.IsNested) t.IsNestedPublic = true; else t.IsPublic = true;
+                // An event and its backing field share a name; leave those fields alone so C# can still bind the event.
+                var eventNames = new HashSet<string>(t.Events.Select(e => e.Name));
+                foreach (var m in t.Methods) m.IsPublic = true;
+                foreach (var f in t.Fields) if (!eventNames.Contains(f.Name)) f.IsPublic = true;
+            }
+            mod.Write(outPath);
+            Console.WriteLine("publicized " + Path.GetFileName(path));
+        }
+        break;
+    }
+    case "detour":
+    {
+        // asmdump detour <shims.dll> <inDir> <outDir>
+        // For every static method in shims.dll marked [Detour("Assembly", "Type.FullName", "Method")], replaces the body of
+        // that method in <inDir>\Assembly.dll with a call to the shim and writes the result to <outDir>. A shim for an
+        // instance method takes the instance as its first parameter. Overloads are picked by the shim's parameter types.
+        // [RedirectCalls("Assembly", "<callee full name>")] instead rewrites every call to that callee inside Assembly.
+        var shims = Load(args[1]);
+        var inDir = args[2];
+        var outDir = args[3];
+        Directory.CreateDirectory(outDir);
+        foreach (var stale in Directory.GetFiles(outDir, "*.dll")) File.Delete(stale);
+
+        var targets = new Dictionary<string, ModuleDefinition>();
+        int count = 0, failed = 0, redirected = 0;
+
+        // References a shim using the target module's own type references, so no self-reference is imported.
+        MethodReference ShimRef(ModuleDefinition mod, MethodDefinition shim, TypeReference returnType, IEnumerable<TypeReference> parameters)
+        {
+            var shimAsm = mod.AssemblyReferences.FirstOrDefault(r => r.Name == shims.Assembly.Name.Name);
+            if (shimAsm == null) mod.AssemblyReferences.Add(shimAsm = new Mono.Cecil.AssemblyNameReference(shims.Assembly.Name.Name, shims.Assembly.Name.Version));
+            TypeReference TypeRef(TypeDefinition t) => t.IsNested
+                ? new TypeReference("", t.Name, mod, null) { DeclaringType = TypeRef(t.DeclaringType) }
+                : new TypeReference(t.Namespace, t.Name, mod, shimAsm);
+            var call = new MethodReference(shim.Name, returnType, TypeRef(shim.DeclaringType)) { HasThis = false };
+            foreach (var p in parameters) call.Parameters.Add(new ParameterDefinition(p));
+            return call;
+        }
+
+        foreach (var shimType in AllTypes(shims))
+        foreach (var shim in shimType.Methods)
+        {
+            foreach (var attr in shim.CustomAttributes.Where(a => a.AttributeType.Name == "RedirectCallsAttribute"))
+            {
+                var asmName = (string)attr.ConstructorArguments[0].Value;
+                var callee = (string)attr.ConstructorArguments[1].Value;
+                if (!targets.TryGetValue(asmName, out var mod))
+                {
+                    var p = Path.Combine(inDir, asmName + ".dll");
+                    if (!File.Exists(p)) { failed++; Console.WriteLine($"REDIRECT FAILED {shim.Name}: assembly {asmName} not found"); continue; }
+                    targets[asmName] = mod = Load(p);
+                }
+                int sites = 0;
+                foreach (var method in AllTypes(mod).SelectMany(t => t.Methods).Where(m => m.HasBody))
+                foreach (var ins in method.Body.Instructions)
+                {
+                    if ((ins.OpCode != OpCodes.Call && ins.OpCode != OpCodes.Callvirt) || ins.Operand is not MethodReference called || called.FullName != callee) continue;
+                    var parameters = new List<TypeReference>();
+                    if (called.HasThis)
+                        parameters.Add(shim.Parameters[0].ParameterType.IsByReference ? new Mono.Cecil.ByReferenceType(called.DeclaringType) : called.DeclaringType);
+                    parameters.AddRange(called.Parameters.Select(p => p.ParameterType));
+                    ins.OpCode = OpCodes.Call;
+                    ins.Operand = ShimRef(mod, shim, called.ReturnType, parameters);
+                    sites++;
+                }
+                if (sites == 0) { failed++; Console.WriteLine($"REDIRECT FAILED {shim.Name}: no call to '{callee}' in {asmName}"); }
+                redirected += sites;
+            }
+
+            foreach (var attr in shim.CustomAttributes.Where(a => a.AttributeType.Name == "DetourAttribute"))
+            {
+                var asmName = (string)attr.ConstructorArguments[0].Value;
+                var typeName = (string)attr.ConstructorArguments[1].Value;
+                var methodName = (string)attr.ConstructorArguments[2].Value;
+                string Fail(string why) { failed++; return $"DETOUR FAILED {shimType.FullName}::{shim.Name} -> [{asmName}] {typeName}::{methodName}: {why}"; }
+
+                if (!shim.IsStatic || shim.HasGenericParameters || shimType.HasGenericParameters) { Console.WriteLine(Fail("shim must be a non-generic static method")); continue; }
+                if (!targets.TryGetValue(asmName, out var mod))
+                {
+                    var p = Path.Combine(inDir, asmName + ".dll");
+                    if (!File.Exists(p)) { Console.WriteLine(Fail("assembly not found")); continue; }
+                    targets[asmName] = mod = Load(p);
+                }
+                var type = AllTypes(mod).FirstOrDefault(t => t.FullName == typeName);
+                if (type == null) { Console.WriteLine(Fail("type not found")); continue; }
+                if (type.HasGenericParameters) { Console.WriteLine(Fail("generic declaring types are not supported")); continue; }
+
+                var shimParams = shim.Parameters.Select(p => p.ParameterType.FullName).ToArray();
+                string[] Expected(MethodDefinition m)
+                {
+                    var list = new List<string>();
+                    if (!m.IsStatic) list.Add(type.IsValueType ? type.FullName + "&" : type.FullName);
+                    list.AddRange(m.Parameters.Select(p => p.ParameterType.FullName));
+                    return list.ToArray();
+                }
+                var named = type.Methods.Where(m => m.Name == methodName && m.HasBody && !m.HasGenericParameters).ToList();
+                var match = named.Where(m => Expected(m).SequenceEqual(shimParams) && m.ReturnType.FullName == shim.ReturnType.FullName).ToList();
+                if (match.Count != 1)
+                {
+                    Console.WriteLine(Fail($"{match.Count} overloads match shim ({shim.ReturnType.FullName})({string.Join(", ", shimParams)}); candidates:"));
+                    foreach (var m in named) Console.WriteLine($"    ({m.ReturnType.FullName})({string.Join(", ", Expected(m))})");
+                    continue;
+                }
+                var target = match[0];
+
+                var callParams = new List<TypeReference>();
+                if (!target.IsStatic) callParams.Add(type.IsValueType ? new Mono.Cecil.ByReferenceType(type) : type);
+                callParams.AddRange(target.Parameters.Select(p => p.ParameterType));
+                var call = ShimRef(mod, shim, target.ReturnType, callParams);
+
+                var body = target.Body;
+                body.Instructions.Clear();
+                body.ExceptionHandlers.Clear();
+                body.Variables.Clear();
+                var il = body.GetILProcessor();
+                for (int i = 0; i < call.Parameters.Count; i++) il.Emit(OpCodes.Ldarg, i);
+                il.Emit(OpCodes.Call, call);
+                il.Emit(OpCodes.Ret);
+                if (target.DebugInformation != null) { target.DebugInformation.SequencePoints.Clear(); target.DebugInformation.Scope = null; }
+                count++;
+            }
+        }
+        foreach (var kv in targets) kv.Value.Write(Path.Combine(outDir, kv.Key + ".dll"));
+        Console.WriteLine($"detoured {count} methods and redirected {redirected} call sites in {targets.Count} assemblies: {string.Join(", ", targets.Keys)}");
+        if (failed > 0) return 1;
+        break;
+    }
+    case "csm":
+    {
+        // asmdump csm <dll> <TypeFullName> [methodRegex]   decompile methods one at a time, surviving ones that fail
+        var path = args[1];
+        var pe = new PEFile(path);
+        var resolver = new UniversalAssemblyResolver(path, false, pe.Reader.DetectTargetFrameworkId());
+        resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(path)));
+        var settings = new DecompilerSettings(ICSharpCode.Decompiler.CSharp.LanguageVersion.Latest) { ThrowOnAssemblyResolveErrors = false, ShowXmlDocumentation = false };
+        var dec = new CSharpDecompiler(path, resolver, settings);
+        var def = dec.TypeSystem.FindType(new FullTypeName(args[2])).GetDefinition();
+        if (def == null) { Console.Error.WriteLine("type not found: " + args[2]); return 1; }
+        var rx = args.Length > 3 ? new Regex(args[3]) : null;
+        foreach (var m in def.Methods)
+        {
+            if (rx != null && !rx.IsMatch(m.Name)) continue;
+            try { Console.WriteLine(dec.DecompileAsString(m.MetadataToken)); }
+            catch (Exception e) { Console.WriteLine($"// failed to decompile {m.Name}: {e.GetType().Name}"); }
+        }
         break;
     }
     case "calli":

@@ -1,50 +1,60 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Stage-2 spike: the same coreclr.dll impersonation as CoreClrStandIn, but with Unity's own
-    managed layer (Unity.Private.Scripting, the UnityEngine modules and the game's Assembly-CSharp)
-    compiled in by NativeAOT, so the engine receives the real InitializationBootstrapper.
+    Publishes the NativeAOT library that replaces CoreCLR\native\coreclr.dll in a CoreCLR player.
+    It has no code of its own: ILC compiles AotRuntime (the exports and replacements), Unity's managed assemblies
+    (the detoured copies where `asmdump detour` made one) and the game's assemblies into one native DLL.
+    Use ..\build-aot.ps1, which prepares the inputs in the right order.
 
-    UnityManaged: the Managed folder of a CoreCLR player build.
-    PatchedDir:   holds a copy of Unity.Private.Scripting.dll with the bootstrapper made public.
+    UnityManaged  the Managed folder of a CoreCLR player build
+    PatchedDir    output of `asmdump detour`
+    AotRoots      assemblies compiled in full, because the engine finds their types and members by name
   -->
+  <!-- build-aot.ps1 writes AotRoots here; a list cannot be passed with -p because MSBuild splits it on ';' and ','. -->
+  <Import Project="$(MSBuildThisFileDirectory)..\builds\aot-roots.props" Condition="Exists('$(MSBuildThisFileDirectory)..\builds\aot-roots.props')" />
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>AotScripting</AssemblyName>
-    <RootNamespace>CoreClrStandIn</RootNamespace>
     <OutputType>Library</OutputType>
     <PublishAot>true</PublishAot>
     <NativeLib>Shared</NativeLib>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <InvariantGlobalization>true</InvariantGlobalization>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
-    <DefineConstants>$(DefineConstants);REAL_SCRIPTING</DefineConstants>
 
-    <UnityManaged Condition="'$(UnityManaged)' == ''">$(MSBuildThisFileDirectory)..\builds\coreclr-standin\Managed</UnityManaged>
-    <PatchedDir Condition="'$(PatchedDir)' == ''">$(MSBuildThisFileDirectory)patched</PatchedDir>
+    <UnityManaged Condition="'$(UnityManaged)' == ''">$(MSBuildThisFileDirectory)..\builds\coreclr\Managed</UnityManaged>
+    <PatchedDir Condition="'$(PatchedDir)' == ''">$(MSBuildThisFileDirectory)..\builds\patched</PatchedDir>
+    <AotRuntimeDll Condition="'$(AotRuntimeDll)' == ''">$(MSBuildThisFileDirectory)..\AotRuntime\bin\Release\net10.0\AotRuntime.dll</AotRuntimeDll>
+    <AotRoots Condition="'$(AotRoots)' == ''">Unity.Private.Scripting;Unity.Scripting;UnityEngine.ScriptingModule;UnityEngine.CoreModule;UnityEngine.ManagedKernelModule;UnityEngine.AnimationModule;UnityEngine;Assembly-CSharp</AotRoots>
 
-    <!-- Report every trim/AOT analysis warning individually so they can be counted. -->
-    <TrimmerSingleWarn>false</TrimmerSingleWarn>
-    <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
-    <NoWarn>$(NoWarn);NU1903;CS0436;CS1701;CS1702</NoWarn>
+    <!-- Iteration speed over code quality by default: no optimisation and no native debug info. -->
+    <Optimize Condition="'$(AotOptimize)' != 'true'">false</Optimize>
+    <DebugType Condition="'$(AotSymbols)' != 'true'">none</DebugType>
+
+    <!-- Unity's embedding layer finds members by name at run time: keep reflection data for everything compiled. -->
+    <IlcTrimMetadata>false</IlcTrimMetadata>
+
+    <!-- The trim/AOT warnings were counted once (see README); they are noise while iterating. -->
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <TrimmerSingleWarn>true</TrimmerSingleWarn>
+    <NoWarn>$(NoWarn);NU1903;CS1701;CS1702;IL2104;IL3053;IL3000;IL3002</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="..\CoreClrStandIn\Exports.cs" Link="Exports.cs" />
-    <Compile Include="..\CoreClrStandIn\Generated.cs" Link="Generated.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
+    <PatchedAsm Include="$(PatchedDir)\*.dll" />
     <UnityAsm Include="$(UnityManaged)\Unity*.dll;$(UnityManaged)\Assembly-CSharp*.dll"
-              Exclude="$(UnityManaged)\Unity.Private.Scripting.dll" />
-    <UnityAsm Include="$(PatchedDir)\Unity.Private.Scripting.dll" />
+              Exclude="@(PatchedAsm->'$(UnityManaged)\%(Filename)%(Extension)')" />
 
-    <!-- Copy-local so the publish pipeline hands them to ILC as compilation inputs. -->
-    <Reference Include="@(UnityAsm)" />
-    <!-- Root whole assemblies: the engine finds types, methods and fields by name at runtime. -->
-    <TrimmerRootAssembly Include="@(UnityAsm->'%(Filename)')" />
+    <!-- Copy-local references are what the publish pipeline hands to ILC as inputs. -->
+    <Reference Include="@(UnityAsm);@(PatchedAsm);$(AotRuntimeDll)" />
+
+    <TrimmerRootAssembly Include="AotRuntime;$(AotRoots)" />
+    <!-- The engine looks up corlib types and methods by name (IEnumerator.MoveNext, IDisposable.Dispose, ...). -->
+    <TrimmerRootDescriptor Include="CorlibRoots.xml" />
+    <!-- Export AotRuntime's [UnmanagedCallersOnly(EntryPoint = ...)] methods from the native library. -->
+    <UnmanagedEntryPointsAssembly Include="AotRuntime" />
   </ItemGroup>
 
 </Project>

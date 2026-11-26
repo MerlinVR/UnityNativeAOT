@@ -48,14 +48,7 @@ namespace CoreClrStandIn
         {
             Log.Line($"unity_coreclr_create_delegate {Str(assemblyName)} :: {Str(typeName)} :: {Str(methodName)}");
             if (Str(methodName) == "InitializationBootstrapper")
-            {
-#if REAL_SCRIPTING
-                // Unity's own bootstrapper, compiled ahead of time into this library.
-                return (delegate* unmanaged[Cdecl]<IntPtr, int, void>)&Unity.Private.Scripting.Initialization.InitializationBootstrapper;
-#else
                 return (delegate* unmanaged[Cdecl]<IntPtr, int, void>)&Bootstrapper;
-#endif
-            }
             Log.Line("  -> no AOT-compiled entry point registered for this method, returning null");
             return null;
         }

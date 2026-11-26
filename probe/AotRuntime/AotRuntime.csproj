@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The code that stands in for Unity's CoreCLR fork when the player's scripts are compiled with NativeAOT:
+    the native exports UnityPlayer.dll binds from coreclr.dll, and replacements ("detours") for the parts of Unity's
+    managed embedding layer that need a JIT or CoreCLR internals.
+
+    It is compiled as plain IL against all-public copies of Unity's assemblies (see `asmdump publicize-all`), then
+    `asmdump detour` rewrites the real assemblies to call into it, and AotScripting compiles everything with ILC.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>AotRuntime</AssemblyName>
+    <RootNamespace>AotRuntime</RootNamespace>
+    <OutputType>Library</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+    <UnityPublicized Condition="'$(UnityPublicized)' == ''">$(MSBuildThisFileDirectory)..\builds\publicized</UnityPublicized>
+    <!-- CS0436/CS0433: Unity embeds the same helper attributes in several assemblies. CS1701/2: Unity's BCL is 10.0.10-dev. -->
+    <NoWarn>$(NoWarn);CS0436;CS1701;CS1702;CS0618;CS8500;SYSLIB0050</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="$(UnityPublicized)\*.dll" Private="false" />
+  </ItemGroup>
+
+</Project>
