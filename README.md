@@ -114,8 +114,8 @@ Known gaps:
 - Token lookups for methods and fields throw, and stack frames in managed code are not symbolised for the engine.
 - `runtime_invoke` and the wrapper accessors go through reflection, which is slow. A build pipeline would generate
   them, as IL2CPP does.
-- Not exercised: rendering (the player ran with `-batchmode -nographics`), packages, Burst, the job system from
-  scripts, domain reload, and anything beyond the test scene.
+- Not exercised: rendering beyond an empty scene, packages, Burst, the job system from scripts, domain reload, and
+  anything else the test scene does not touch.
 
 When the player dies without a message, the fail-fast text and managed stack are in the Windows Application event
 log under the `.NET Runtime` source.
@@ -149,3 +149,7 @@ log under the `.NET Runtime` source.
 - One liveness pass in that scene: 5 roots, 70,816 objects visited (70,793 of them from statics), 10 reported, and
   the no-GC region held.
 - Optimised, with the default eight roots: 18.4 MB, about 15 seconds, same output.
+- Optimised with `-AllRoots`: 119.8 MB, about 16 minutes in ILC and the linker, same output.
+- That optimised build with graphics on (`Probe.exe -screen-fullscreen 0 -screen-width 480 -screen-height 270`,
+  Direct3D 12): same output, exit code 0. The scene holds only the default camera and light, so this covers device
+  creation and the frame loop, not rendering features.
